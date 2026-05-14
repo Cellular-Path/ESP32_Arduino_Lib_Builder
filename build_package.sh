@@ -32,39 +32,91 @@ export IDF_BRANCH="${IDF_BRANCH:-release/v5.5}"
 info "IDF_COMMIT = $IDF_COMMIT"
 info "IDF_BRANCH = $IDF_BRANCH"
 
-# ── verify components present ─────────────────────────────────────────────────
-MISSING=0
-if [ ! -d "components/arduino" ]; then
-    warn "components/arduino is missing."
-    MISSING=1
-fi
-if [ ! -d "components/arduino_tinyusb/tinyusb" ]; then
-    warn "components/arduino_tinyusb/tinyusb is missing."
-    MISSING=1
+# ── provision components if absent ──────────────────────────────────────────
+# Pinned sources – change these if you fork or bump versions.
+ARDUINO_REPO="${ARDUINO_REPO:-https://github.com/Rapid-Prototypes-LLC/arduino-esp32-exp.git}"
+ARDUINO_COMMIT="${ARDUINO_COMMIT:-5c35a34}"
+TINYUSB_REPO="${TINYUSB_REPO:-https://github.com/hathach/tinyusb.git}"
+TINYUSB_TAG="${TINYUSB_TAG:-0.19.0}"
+
+# Local seed path (dev machine shortcut – skips GitHub clones if present)
+LOCAL_SEED="/home/dilawar/ai_build/build_tls13_s3/esp32-arduino-lib-builder"
+
+provision_arduino() {
+    if [ -d "$LOCAL_SEED/components/arduino" ]; then
+        info "Seeding Arduino source from local build..."
+        mkdir -p components/arduino
+        rsync -a --exclude='.git' "$LOCAL_SEED/components/arduino/" components/arduino/
+    else
+        info "Cloning Arduino core ($ARDUINO_REPO @ $ARDUINO_COMMIT) ..."
+        git clone --depth 200 "$ARDUINO_REPO" components/arduino
+        git -C components/arduino checkout "$ARDUINO_COMMIT"
+    fi
+}
+
+provision_tinyusb() {
+    if [ -d "$LOCAL_SEED/components/arduino_tinyusb/tinyusb" ]; then
+        info "Seeding TinyUSB from local build..."
+        mkdir -p components/arduino_tinyusb/tinyusb
+        rsync -a --exclude='.git' "$LOCAL_SEED/components/arduino_tinyusb/tinyusb/" components/arduino_tinyusb/tinyusb/
+    else
+        info "Cloning TinyUSB ($TINYUSB_TAG) ..."
+        git clone --depth 1 --branch "$TINYUSB_TAG" "$TINYUSB_REPO" \
+            components/arduino_tinyusb/tinyusb
+    fi
+}
+
+if [ ! -d "components/arduino" ] || [ -z "$(ls -A components/arduino 2>/dev/null)" ]; then
+    warn "components/arduino missing – provisioning automatically..."
+    provision_arduino
+    info "Arduino source ready."
 fi
 
-if [ "$MISSING" -eq 1 ]; then
-    die "One or more required component directories are absent.
-    
-    If you are on the machine that has the original working build, run:
-        ./seed_from_local.sh
-    
-    Then re-run this script.
-    
-    If you cloned this repo fresh, you need to add the components:
-        git submodule update --init --recursive
-    or copy them manually into components/arduino/ and
-    components/arduino_tinyusb/tinyusb/"
+if [ ! -d "components/arduino_tinyusb/tinyusb" ] || [ -z "$(ls -A components/arduino_tinyusb/tinyusb 2>/dev/null)" ]; then
+    warn "TinyUSB missing – provisioning automatically..."
+    provision_tinyusb
+    info "TinyUSB ready."
 fi
+
+ensure_executable_scripts() {
+    # Fresh clones or copies can lose executable bits on helper scripts.
+    chmod +x ./build.sh || true
+    find ./tools -maxdepth 1 -type f -name '*.sh' -exec chmod +x {} +
+}
+
+verify_tinyusb_cmake_layout_logic() {
+    local cmake_file="components/arduino_tinyusb/CMakeLists.txt"
+    if [ ! -f "$cmake_file" ]; then
+        die "Missing $cmake_file"
+    fi
+
+    if grep -q 'portable/synopsys/dwc2/dcd_dwc2.c' "$cmake_file" && \
+       grep -q 'portable/espressif/esp32s2/dcd_esp32s2.c' "$cmake_file"; then
+        info "TinyUSB CMake compatibility logic is present."
+    else
+        warn "TinyUSB CMake compatibility logic was not detected in $cmake_file"
+        warn "Build may fail on TinyUSB layout differences; update this file to support both layouts."
+    fi
+}
+
+ensure_executable_scripts
+verify_tinyusb_cmake_layout_logic
 
 # ── install / verify ESP-IDF ──────────────────────────────────────────────────
+# Pre-export IDF_PATH so config.sh never sees it as unbound under set -u
+export IDF_PATH="$SCRIPT_DIR/esp-idf"
+
 if [ ! -d "esp-idf" ]; then
     info "ESP-IDF not found – installing (this takes a while on first run)..."
-    # install-esp-idf.sh clones and pins the commit, installs toolchain
+    # Tools scripts were not written for strict mode; relax -u around source calls
+    set +u
     source ./tools/install-esp-idf.sh
+    set -u
 else
     info "ESP-IDF already present, sourcing environment..."
+    set +u
     source esp-idf/export.sh
+    set -u
     # Confirm pinned commit
     CURRENT_COMMIT=$(git -C esp-idf rev-parse --short HEAD 2>/dev/null || echo "unknown")
     if [ "$CURRENT_COMMIT" != "$IDF_COMMIT" ]; then
@@ -81,9 +133,11 @@ info "IDF_VERSION = $IDF_VERSION"
 info "Starting ESP32-S3 build (target=esp32s3, TLS 1.3 enabled)..."
 info "This will take 30-90 minutes on first run."
 
+set +u
 ./build.sh -s -t esp32s3
-
 BUILD_EXIT=$?
+set -u
+
 if [ $BUILD_EXIT -ne 0 ]; then
     die "build.sh exited with code $BUILD_EXIT"
 fi
